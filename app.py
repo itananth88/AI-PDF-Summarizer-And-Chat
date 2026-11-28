@@ -12,14 +12,22 @@ from pdf_summarizer import (
 
 load_dotenv()
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _resolve_project_path(folder: str) -> Path:
+    path = Path(folder).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
 st.set_page_config(page_title="PDF Summarizer & Chat", page_icon="📚", layout="wide")
 st.title("PDF Summarizer & Chat")
 st.caption("Summarize a folder of PDFs, then ask questions grounded in the saved summaries.")
 
 with st.sidebar:
-    st.header("Hugging Face model")
-    st.caption("Configure a Hugging Face Inference Providers token and model ID in `.env`.")
-    st.code("HF_TOKEN\nHF_MODEL_ID", language="text")
+    st.header("Groq model")
+    st.caption("Configure a Groq API key and optional model ID in `.env`.")
+    st.code("GROQ_API_KEY\nGROQ_MODEL_ID", language="text")
 
 batch_column, chat_column = st.columns([1, 1], gap="large")
 
@@ -30,8 +38,8 @@ with batch_column:
     st.caption("Each PDF produces a Markdown summary in the output folder.")
 
     if st.button("Run PDF summarizer", type="primary", use_container_width=True):
-        source = Path(input_folder).expanduser()
-        destination = Path(output_folder).expanduser()
+        source = _resolve_project_path(input_folder)
+        destination = _resolve_project_path(output_folder)
         if not input_folder.strip():
             st.error("Enter the path to a folder containing PDF files.")
         elif not source.is_dir():
@@ -51,13 +59,18 @@ with batch_column:
                     progress = st.progress(0, text="Preparing PDFs...")
                     successes, failures = [], []
                     for index, pdf_path in enumerate(pdfs, start=1):
-                        progress.progress(
-                            (index - 1) / len(pdfs),
-                            text=f"Summarizing {pdf_path.name} ({index}/{len(pdfs)})...",
-                        )
+                        def update_progress(fraction: float, message: str) -> None:
+                            progress.progress(
+                                (index - 1 + fraction) / len(pdfs),
+                                text=f"{pdf_path.name} ({index}/{len(pdfs)}): {message}",
+                            )
+
                         try:
                             output_path = summarize_folder(
-                                client, pdf_path, destination
+                                client,
+                                pdf_path,
+                                destination,
+                                progress_callback=update_progress,
                             )
                             successes.append(output_path.name)
                         except Exception as exc:
@@ -83,7 +96,7 @@ with chat_column:
         value=output_folder,
         key="chat_folder",
     )
-    summary_files = list_summary_files(Path(chat_folder).expanduser())
+    summary_files = list_summary_files(_resolve_project_path(chat_folder))
     if summary_files:
         st.caption(
             f"Ready to search {len(summary_files)} summary file(s). "

@@ -1,8 +1,9 @@
 # PDF Summarizer & Chat
 
 A local Streamlit application that summarizes PDFs in a folder into Markdown
-files, then answers questions using those saved summaries. It uses chat models
-available through Hugging Face Inference Providers.
+files, then answers questions using those saved summaries. It uses Groq-hosted
+chat models; a Groq API key is required, and free-tier usage is subject to
+Groq's current rate limits and availability.
 
 ## Pipeline
 
@@ -20,10 +21,12 @@ available through Hugging Face Inference Providers.
    python -m pip install -r requirements.txt
    ```
 
-4. Create a Hugging Face access token with permission to use Inference
-   Providers. Copy `.env.example` to `.env`, then set `HF_TOKEN` and
-   `HF_MODEL_ID` to your token and a chat-completion model available to your
-   account. Keep `.env` private; never paste the token into chat or commit it.
+4. Create a Groq API key at <https://console.groq.com/keys>. Copy
+   `.env.example` to `.env` if `.env` does not already exist; otherwise add
+   `GROQ_API_KEY` to the existing file. The default model is
+   `openai/gpt-oss-20b`; optionally set `GROQ_MODEL_ID` to another model
+   supported by your Groq account. Keep `.env` private; never paste the key
+   into chat or commit it.
 5. Launch the interface:
 
    ```powershell
@@ -32,7 +35,9 @@ available through Hugging Face Inference Providers.
 
 6. In the first panel, enter the input PDF folder and output folder, then
    select **Run PDF summarizer**. The app defaults to `input_pdfs` and
-   `summaries`. Successful PDFs produce `<pdf-name>.summary.md` files.
+`summaries`, resolved relative to the app directory. Progress updates for
+each PDF text extraction, chunk summary, and final synthesis. Successful
+PDFs produce `<pdf-name>.summary.md` files.
    Individual failures are reported while the remaining PDFs continue
    processing.
 7. In the chat panel, select the folder containing those summary files and ask
@@ -47,8 +52,10 @@ available through Hugging Face Inference Providers.
   synthesis. The chat retrieves matching excerpts from generated summaries;
   answers can still be incomplete, so verify consequential details against
   the original PDF.
-- Extracted PDF text and chat context are sent to the Hugging Face Inference
-  Provider serving the selected model. Do not process sensitive documents
+- Temporary Groq rate-limit responses are retried up to three times, honoring
+  the provider's retry delay when available, with a 65-second total wait cap.
+- Extracted PDF text and chat context are sent to Groq and its serving
+  infrastructure. Do not process sensitive documents
   unless your data-handling requirements allow this.
 - This initial version processes PDFs in the selected folder (not nested
   subfolders) and writes Markdown summaries.

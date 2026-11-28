@@ -1,15 +1,23 @@
 import os
 import re
 import shutil
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pymupdf
 from huggingface_hub import InferenceClient
+from huggingface_hub.errors import HfHubHTTPError
 
 CHUNK_SIZE = 12_000
 CHUNK_OVERLAP = 500
 CHAT_CHUNK_SIZE = 3_000
 MAX_CHAT_CONTEXTS = 5
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
+MAX_RATE_LIMIT_RETRIES = 3
+MAX_RATE_LIMIT_WAIT_SECONDS = 65
+RATE_LIMIT_DELAY_PATTERN = re.compile(r"try again in\s+([\d.]+)\s*s", re.IGNORECASE)
 WORD_PATTERN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9'-]{1,}")
 STOP_WORDS = {
     "about", "after", "also", "and", "are", "because", "been", "before",
@@ -21,24 +29,79 @@ STOP_WORDS = {
 
 
 def create_client() -> InferenceClient:
-    token = os.getenv("HF_TOKEN", "").strip()
-    model_id = os.getenv("HF_MODEL_ID", "").strip()
-    if not token or not model_id:
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    model_id = os.getenv("GROQ_MODEL_ID", DEFAULT_GROQ_MODEL).strip()
+    if not api_key:
         raise ValueError(
-            "Configure HF_TOKEN and HF_MODEL_ID in the .env file."
+            "Configure GROQ_API_KEY in the .env file. Create a key at "
+            "https://console.groq.com/keys."
         )
-    return InferenceClient(model=model_id, token=token)
+    if not model_id:
+        raise ValueError("GROQ_MODEL_ID cannot be empty.")
+    return InferenceClient(base_url=GROQ_BASE_URL, api_key=api_key)
 
 
-def _complete(client: InferenceClient, system_prompt: str, user_prompt: str) -> str:
-    response = client.chat_completion(
-        temperature=0.2,
-        max_tokens=2048,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
+def _rate_limit_delay(error: HfHubHTTPError, attempt: int) -> float:
+    headers = getattr(error.response, "headers", {})
+    retry_after = headers.get("retry-after")
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            pass
+
+    reset_delay = headers.get("x-ratelimit-reset-tokens")
+    if reset_delay:
+        match = re.fullmatch(r"\s*([\d.]+)\s*s?\s*", reset_delay)
+        if match:
+            return float(match.group(1))
+
+    match = RATE_LIMIT_DELAY_PATTERN.search(str(error))
+    if match:
+        return float(match.group(1))
+    return float(2**attempt)
+
+
+def _complete(
+    client: InferenceClient,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 1024,
+) -> str:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    model_id = os.getenv("GROQ_MODEL_ID", DEFAULT_GROQ_MODEL).strip()
+    request_options = {
+        "model": model_id,
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+    if model_id.startswith("openai/gpt-oss-"):
+        request_options["extra_body"] = {
+            "reasoning_effort": "low",
+            "reasoning_format": "hidden",
+        }
+
+    waited_seconds = 0.0
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        try:
+            response = client.chat_completion(**request_options)
+            break
+        except HfHubHTTPError as exc:
+            if (
+                exc.response.status_code != 429
+                or attempt >= MAX_RATE_LIMIT_RETRIES
+            ):
+                raise
+            delay = _rate_limit_delay(exc, attempt)
+            if waited_seconds + delay > MAX_RATE_LIMIT_WAIT_SECONDS:
+                raise
+            time.sleep(delay)
+            waited_seconds += delay
+
     content = response.choices[0].message.content
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("The configured AI model returned an empty response.")
@@ -106,13 +169,24 @@ def _split_text(text: str, size: int, overlap: int) -> list[str]:
 
 
 def summarize_folder(
-    client: InferenceClient, pdf_path: Path, output_folder: Path
+    client: InferenceClient,
+    pdf_path: Path,
+    output_folder: Path,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> Path:
+    if progress_callback:
+        progress_callback(0.0, "Extracting PDF text...")
     text = _extract_pdf_text(pdf_path)
     output_folder.mkdir(parents=True, exist_ok=True)
     chunks = _split_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+    total_steps = len(chunks) + 1
     partial_summaries = []
     for index, chunk in enumerate(chunks, start=1):
+        if progress_callback:
+            progress_callback(
+                (index - 1) / total_steps,
+                f"Summarizing part {index} of {len(chunks)}...",
+            )
         partial_summaries.append(
             _complete(
                 client,
@@ -121,6 +195,16 @@ def summarize_folder(
                 "Do not invent details.",
                 f"Summarize this part of {pdf_path.name} (part {index} of {len(chunks)}):\n\n{chunk}",
             )
+        )
+        if progress_callback:
+            progress_callback(
+                index / total_steps,
+                f"Completed part {index} of {len(chunks)}.",
+            )
+    if progress_callback:
+        progress_callback(
+            len(chunks) / total_steps,
+            "Creating the final summary...",
         )
     final_summary = _complete(
         client,
@@ -134,6 +218,7 @@ def summarize_folder(
             f"Part {index} summary:\n{summary}"
             for index, summary in enumerate(partial_summaries, start=1)
         ),
+        max_tokens=2048,
     )
     output_path = output_folder / f"{pdf_path.stem}.summary.md"
     output_path.write_text(
@@ -143,6 +228,8 @@ def summarize_folder(
         f"{final_summary}\n",
         encoding="utf-8",
     )
+    if progress_callback:
+        progress_callback(1.0, "Summary saved.")
     return output_path
 
 
